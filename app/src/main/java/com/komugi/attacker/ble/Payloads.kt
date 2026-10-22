@@ -17,7 +17,7 @@ data class BlePayload(
     val data: ByteArray,
 ) {
     fun toHex(): String = buildString {
-        append(String.format(Locale.US, "%02X%02X ", (companyId shr 8) and 0xFF, companyId and 0xFF))
+        append(String.format(Locale.US, "%02X%02X ", companyId and 0xFF, (companyId shr 8) and 0xFF))
         data.forEach { append(String.format(Locale.US, "%02X ", it.toInt() and 0xFF)) }
     }.trim()
 
@@ -153,7 +153,9 @@ object Payloads {
         val bytes = ByteArray(clean.length / 2) { i ->
             clean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
         }
-        val companyId = companyOverride ?: ((bytes[0].toInt() and 0xFF) shl 8) or (bytes[1].toInt() and 0xFF)
+        // Manufacturer data carries the company id little endian: 4C 00 means 0x004C.
+        val companyId = companyOverride
+            ?: (((bytes[1].toInt() and 0xFF) shl 8) or (bytes[0].toInt() and 0xFF))
         val body = if (companyOverride == null) bytes.drop(2).toByteArray() else bytes
         if (body.size > MAX_PAYLOAD_BYTES) return null
         return BlePayload(
