@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">KomugiAttacker</string>
+    <string name="notification_channel">Engine</string>
+    <string name="notification_title">KomugiAttacker engine running</string>
+    <string name="notification_stop">Stop</string>
+</resources>

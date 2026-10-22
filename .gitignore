@@ -1,0 +1,21 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+app/build
+*.apk
+*.aab
+keystore.properties
+*.jks
+*.keystore
+
+# source font blobs stay local; the packaged subset lives in app/src/main/res/font
+fonts/*.ttf
+fonts/static/*.ttf
+AGENTS.md
