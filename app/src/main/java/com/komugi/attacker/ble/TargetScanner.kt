@@ -8,22 +8,36 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.os.Build
 import androidx.core.content.ContextCompat
+import java.util.concurrent.ConcurrentHashMap
 
 data class TargetDevice(
     val address: String,
     val name: String,
     val rssi: Int,
     val bondState: Int,
+    val isBle: Boolean = true,
 ) {
-    val label: String get() = if (name.isBlank()) "Unknown device" else name
+    val isBonded: Boolean get() = bondState == BluetoothDevice.BOND_BONDED
+    val label: String get() = when {
+        name.isNotBlank() -> name
+        isBonded -> "Paired ($address)"
+        else -> "Unknown ($address)"
+    }
 }
 
 /**
- * Passive LE scan used to build the target list and to feed the connect flood when no
- * explicit target is chosen. Results are kept in memory only.
+ * Scans for real nearby active devices:
+ * 1. Reads bonded/paired devices directly from BluetoothAdapter (headphones, watches, cars, etc.).
+ * 2. Starts Classic Bluetooth discovery (`startDiscovery`) to find active BR/EDR devices with friendly names.
+ * 3. Starts BLE scan (`startScan`) to find advertising LE devices.
+ * 4. Merges and deduplicates results by MAC address, prioritizing bonded and named devices.
  */
 @SuppressLint("MissingPermission")
 class TargetScanner(
@@ -31,48 +45,124 @@ class TargetScanner(
     private val onUpdate: (List<TargetDevice>) -> Unit,
 ) {
 
-    private val devices = LinkedHashMap<String, TargetDevice>()
+    private val devices = ConcurrentHashMap<String, TargetDevice>()
     private var running = false
     private var adapter: BluetoothAdapter? = null
+    private var receiverRegistered = false
 
-    private val callback = object : ScanCallback() {
+    private val classicReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, intent: Intent) {
+            when (intent.action) {
+                BluetoothDevice.ACTION_FOUND -> {
+                    val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    }
+                    if (device != null) {
+                        val name = intent.getStringExtra(BluetoothDevice.EXTRA_NAME)
+                            ?: runCatching { device.name }.getOrNull().orEmpty()
+                        val rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, -70).toInt()
+                        ingestClassic(device, name, rssi)
+                    }
+                }
+                BluetoothDevice.ACTION_NAME_CHANGED -> {
+                    val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    }
+                    val name = intent.getStringExtra(BluetoothDevice.EXTRA_NAME).orEmpty()
+                    if (device != null && name.isNotBlank()) {
+                        val existing = devices[device.address]
+                        if (existing != null) {
+                            devices[device.address] = existing.copy(name = name)
+                            notifyUpdate()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private val bleCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            ingest(result)
+            ingestBle(result)
         }
 
         override fun onBatchScanResults(results: MutableList<ScanResult>) {
-            results.forEach(::ingest)
-            onUpdate(snapshot())
+            results.forEach(::ingestBle)
         }
 
         override fun onScanFailed(errorCode: Int) {
-            SpamState.log("scan: failed code=$errorCode")
+            SpamState.log("scan: BLE scan failed code=$errorCode")
         }
     }
 
-    private fun ingest(result: ScanResult) {
-        val device = result.device ?: return
-        val previous = devices[device.address]
-        val name = runCatching { device.name }.getOrNull()
-            ?: previous?.name
-            ?: result.scanRecord?.deviceName
-            ?: ""
-        devices[device.address] = TargetDevice(
-            address = device.address,
+    private fun ingestClassic(device: BluetoothDevice, discoveredName: String, rssi: Int) {
+        val address = device.address ?: return
+        val existing = devices[address]
+        val name = when {
+            discoveredName.isNotBlank() -> discoveredName
+            existing?.name?.isNotBlank() == true -> existing.name
+            else -> runCatching { device.name }.getOrNull().orEmpty()
+        }
+        val bond = runCatching { device.bondState }.getOrDefault(BluetoothDevice.BOND_NONE)
+        devices[address] = TargetDevice(
+            address = address,
             name = name,
-            rssi = result.rssi,
-            bondState = runCatching { device.bondState }.getOrDefault(BluetoothDevice.BOND_NONE),
+            rssi = if (rssi != 0) rssi else (existing?.rssi ?: -70),
+            bondState = bond,
+            isBle = false,
         )
-        onUpdate(snapshot())
+        notifyUpdate()
     }
 
-    fun snapshot(): List<TargetDevice> = devices.values.sortedByDescending { it.rssi }
+    private fun ingestBle(result: ScanResult) {
+        val device = result.device ?: return
+        val address = device.address ?: return
+        val existing = devices[address]
+        val scanRecordName = runCatching { result.scanRecord?.deviceName }.getOrNull()
+        val name = when {
+            existing?.name?.isNotBlank() == true -> existing.name
+            !scanRecordName.isNullOrBlank() -> scanRecordName
+            else -> runCatching { device.name }.getOrNull().orEmpty()
+        }
+        val bond = runCatching { device.bondState }.getOrDefault(BluetoothDevice.BOND_NONE)
+        devices[address] = TargetDevice(
+            address = address,
+            name = name,
+            rssi = result.rssi,
+            bondState = bond,
+            isBle = true,
+        )
+        notifyUpdate()
+    }
+
+    private var lastNotifyTime = 0L
+    private fun notifyUpdate() {
+        val now = System.currentTimeMillis()
+        if (now - lastNotifyTime > 300) {
+            lastNotifyTime = now
+            onUpdate(snapshot())
+        }
+    }
+
+    fun snapshot(): List<TargetDevice> {
+        return devices.values.sortedWith(
+            compareByDescending<TargetDevice> { it.isBonded }
+                .thenByDescending { it.name.isNotBlank() }
+                .thenByDescending { it.rssi }
+        )
+    }
 
     fun devices(): List<BluetoothDevice> {
         val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        val adapter = manager?.adapter ?: return emptyList()
+        val ad = manager?.adapter ?: return emptyList()
         return devices.keys.mapNotNull { address ->
-            runCatching { adapter.getRemoteDevice(address) }.getOrNull()
+            runCatching { ad.getRemoteDevice(address) }.getOrNull()
         }
     }
 
@@ -84,32 +174,74 @@ class TargetScanner(
         }
         val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         adapter = manager?.adapter
-        val scanner = adapter?.bluetoothLeScanner
-        if (adapter?.isEnabled != true || scanner == null) {
+        if (adapter?.isEnabled != true) {
             SpamState.log("scan: bluetooth is off")
             return
         }
+
         devices.clear()
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-            .build()
-        running = runCatching { scanner.startScan(null, settings, callback) }.isSuccess
-        SpamState.log(if (running) "scan: listening" else "scan: start rejected")
+
+        // 1. Load paired (bonded) devices immediately!
+        runCatching {
+            adapter?.bondedDevices?.forEach { device ->
+                val name = runCatching { device.name }.getOrNull().orEmpty()
+                devices[device.address] = TargetDevice(
+                    address = device.address,
+                    name = name,
+                    rssi = -50,
+                    bondState = BluetoothDevice.BOND_BONDED,
+                    isBle = false,
+                )
+            }
+        }
+        onUpdate(snapshot())
+
+        // 2. Register classic discovery receiver
+        try {
+            val filter = IntentFilter().apply {
+                addAction(BluetoothDevice.ACTION_FOUND)
+                addAction(BluetoothDevice.ACTION_NAME_CHANGED)
+            }
+            context.registerReceiver(classicReceiver, filter)
+            receiverRegistered = true
+            adapter?.startDiscovery()
+        } catch (e: Exception) {
+            SpamState.log("scan: classic discovery error: ${e.message}")
+        }
+
+        // 3. Start BLE scan
+        val scanner = adapter?.bluetoothLeScanner
+        if (scanner != null) {
+            val settings = ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                .build()
+            runCatching { scanner.startScan(null, settings, bleCallback) }
+        }
+
+        running = true
+        SpamState.log("scan: listening for real devices (bonded=${devices.size})")
     }
 
     fun stop() {
         if (!running) return
         running = false
-        val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        runCatching { manager?.adapter?.bluetoothLeScanner?.stopScan(callback) }
-        SpamState.log("scan: stopped, ${devices.size} devices cached")
+
+        if (receiverRegistered) {
+            runCatching { context.unregisterReceiver(classicReceiver) }
+            receiverRegistered = false
+        }
+        runCatching { adapter?.cancelDiscovery() }
+        runCatching { adapter?.bluetoothLeScanner?.stopScan(bleCallback) }
+
+        onUpdate(snapshot())
+        SpamState.log("scan: stopped, ${devices.size} devices found")
     }
 
     fun isRunning(): Boolean = running
 
     private fun hasScanPermission(): Boolean {
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S) return true
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
         return ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) ==
             PackageManager.PERMISSION_GRANTED
     }

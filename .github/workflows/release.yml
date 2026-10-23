@@ -1,0 +1,46 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.9'
+
+      - name: Unit tests
+        run: gradle :app:testDebugUnitTest --no-daemon
+
+      - name: Assemble APKs
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          files: app/build/outputs/apk/debug/*.apk
+          body: |
+            ### KomugiAttacker v1.0.1
+            
+            #### Fixes & Improvements:
+            - **Real Device Discovery**: Scanner now loads bonded/paired devices (`adapter.bondedDevices`) immediately and runs Classic Bluetooth Discovery (`startDiscovery`) alongside BLE scan to show real nearby devices with friendly names instead of anonymous MAC noise.
+            - **Crash on Start Fixed**: Fixed Bluetooth controller HCI queue overflow / crash caused by aggressive 12ms stop/start cycling. Stabilized advertising pacing (>=150ms interval, 60ms settle delay).
+            - **GATT & RFCOMM Hardening**: Added thread-safe connection closing, caught all throwables (preventing unhandled SecurityException/NPE), and added GATT client throttling.
+            - **Stability**: Recreatable coroutine scope in Foreground Service, safe wake-lock handling, and global exception logging.
+          draft: false
+          prerelease: false

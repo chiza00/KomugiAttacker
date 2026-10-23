@@ -1,4 +1,4 @@
-﻿package com.komugi.attacker.ui
+package com.komugi.attacker.ui
 
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.LinearEasing
@@ -113,6 +113,7 @@ fun MainScreen(
     snackbarHostState: SnackbarHostState,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    onOpenScan: () -> Unit = {},
 ) {
     val snapshot by viewModel.snapshot.collectAsState()
     var showTargetSheet by remember { mutableStateOf(false) }
@@ -188,7 +189,7 @@ fun MainScreen(
                 targetName = viewModel.config.targetName,
                 targetAddress = viewModel.config.targetAddress,
                 onOpenScan = {
-                    if (!viewModel.scanning) viewModel.toggleScan()
+                    onOpenScan()
                     showTargetSheet = true
                 },
                 onClear = { viewModel.selectTarget(null) },
@@ -238,7 +239,7 @@ fun MainScreen(
                 targets = viewModel.targets,
                 scanning = viewModel.scanning,
                 selected = viewModel.config.targetAddress,
-                onRefresh = { viewModel.toggleScan() },
+                onRefresh = onOpenScan,
                 onSelect = {
                     viewModel.selectTarget(it)
                     viewModel.stopScan()
@@ -775,9 +776,9 @@ private fun TargetSheet(
                             )
                         }
                         Text(
-                            "${device.rssi} dBm",
+                            text = if (device.isBonded) "Paired" else "${device.rssi} dBm",
                             style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.primary,
+                            color = if (device.isBonded) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary,
                         )
                     }
                 }

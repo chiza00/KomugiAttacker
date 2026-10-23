@@ -14,7 +14,7 @@ data class SpamConfig(
     val mode: SpamMode = SpamMode.ADVERTISE,
     val family: PayloadFamily = PayloadFamily.APPLE,
     val customHex: String = "",
-    val intervalMs: Int = 100,
+    val intervalMs: Int = 150,
     val threads: Int = 6,
     val targetAddress: String? = null,
     val targetName: String? = null,
@@ -24,7 +24,7 @@ data class SpamConfig(
     val effectiveThreads: Int get() = threads.coerceIn(MIN_THREADS, MAX_THREADS)
 
     companion object {
-        const val MIN_INTERVAL = 20
+        const val MIN_INTERVAL = 100
         const val MAX_INTERVAL = 2000
         const val MIN_THREADS = 1
         const val MAX_THREADS = 16

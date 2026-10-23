@@ -26,7 +26,8 @@ import kotlinx.coroutines.cancel
 
 class SpamService : Service() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var serviceJob = SupervisorJob()
+    private var scope = CoroutineScope(serviceJob + Dispatchers.Default)
     private var advertiseEngine: AdvertiseEngine? = null
     private var flooder: ConnectFlooder? = null
     private var scanner: TargetScanner? = null
@@ -55,6 +56,10 @@ class SpamService : Service() {
 
     private fun launchEngine(config: SpamConfig) {
         stopEngines()
+        if (serviceJob.isCancelled) {
+            serviceJob = SupervisorJob()
+            scope = CoroutineScope(serviceJob + Dispatchers.Default)
+        }
         val manager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val adapter = manager?.adapter
         if (adapter == null || !adapter.isEnabled) {
@@ -85,7 +90,6 @@ class SpamService : Service() {
                     context = this,
                     config = config,
                     payloads = payloads,
-                    namePool = AdvertiseEngine.NAME_POOL,
                 ).also { it.start(scope) }
             }
 
@@ -154,9 +158,9 @@ class SpamService : Service() {
     private fun shutdown() {
         stopEngines()
         SpamState.stop()
-        scope.cancel()
+        serviceJob.cancel()
         releaseWakeLock()
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
     }
 
     override fun onDestroy() {
@@ -179,24 +183,30 @@ class SpamService : Service() {
     }
 
     private fun startForegroundSafely() {
-        val manager = getSystemService(NotificationManager::class.java)
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            getString(R.string.notification_channel),
-            NotificationManager.IMPORTANCE_LOW,
-        ).apply { setShowBadge(false) }
-        manager?.createNotificationChannel(channel)
-        val notification = buildNotification("Preparing engine")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        try {
+            val manager = getSystemService(NotificationManager::class.java)
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                getString(R.string.notification_channel),
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply { setShowBadge(false) }
+            manager?.createNotificationChannel(channel)
+            val notification = buildNotification("Preparing engine")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (t: Throwable) {
+            SpamState.log("service: foreground start error: ${t.javaClass.simpleName}")
         }
     }
 
     private fun updateNotification(targetLabel: String) {
-        val manager = getSystemService(NotificationManager::class.java) ?: return
-        manager.notify(NOTIFICATION_ID, buildNotification(targetLabel))
+        runCatching {
+            val manager = getSystemService(NotificationManager::class.java) ?: return
+            manager.notify(NOTIFICATION_ID, buildNotification(targetLabel))
+        }
     }
 
     private fun buildNotification(targetLabel: String): Notification {

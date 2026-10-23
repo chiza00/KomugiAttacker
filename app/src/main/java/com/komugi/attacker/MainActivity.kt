@@ -1,4 +1,4 @@
-﻿package com.komugi.attacker
+package com.komugi.attacker
 
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
@@ -14,13 +14,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.komugi.attacker.ble.SpamState
 import com.komugi.attacker.ui.MainScreen
 import com.komugi.attacker.ui.theme.KomugiTheme
 import kotlinx.coroutines.launch
@@ -29,6 +29,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            SpamState.log("fatal: ${throwable.javaClass.simpleName} in ${thread.name}")
+            defaultHandler?.uncaughtException(thread, throwable)
+        }
         setContent {
             KomugiTheme {
                 KomugiApp()
@@ -36,8 +41,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
-
-
 
 @Composable
 private fun KomugiApp() {
@@ -54,7 +57,7 @@ private fun KomugiApp() {
 
     fun startEngineNow() {
         if (!isBluetoothEnabled(context)) {
-            toast("Bluetooth is off вЂ” turn it on first")
+            toast("Bluetooth is off - turn it on first")
             return
         }
         viewModel.start()
@@ -70,7 +73,26 @@ private fun KomugiApp() {
             startEngineNow()
         } else if (!bleGranted) {
             pendingStart.value = false
-            toast("Bluetooth permissions denied вЂ” engine cannot reach the radio")
+            toast("Bluetooth permissions denied - engine cannot reach the radio")
+        }
+    }
+
+    val scanPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        val bleGranted = result.filterKeys { it in blePermissions() }.values.all { it }
+        if (bleGranted) {
+            if (!viewModel.scanning) viewModel.toggleScan()
+        } else {
+            toast("Bluetooth permissions denied - cannot scan for devices")
+        }
+    }
+
+    fun openScan() {
+        if (!hasBlePermissions(context)) {
+            scanPermissionLauncher.launch(requiredPermissions())
+        } else {
+            if (!viewModel.scanning) viewModel.toggleScan()
         }
     }
 
@@ -82,7 +104,7 @@ private fun KomugiApp() {
             viewModel.start()
         } else if (pendingStart.value) {
             pendingStart.value = false
-            toast("Bluetooth stayed off вЂ” engine not started")
+            toast("Bluetooth stayed off - engine not started")
         }
     }
 
@@ -98,15 +120,7 @@ private fun KomugiApp() {
             return
         }
         pendingStart.value = false
-        viewModel.start()
-    }
-
-    // A permission dialog result that arrives after a config change still needs to start.
-    LaunchedEffect(awaitingPermission.value) {
-        if (!awaitingPermission.value && pendingStart.value && hasBlePermissions(context)) {
-            pendingStart.value = false
-            startEngineNow()
-        }
+        startEngineNow()
     }
 
     MainScreen(
@@ -114,6 +128,7 @@ private fun KomugiApp() {
         snackbarHostState = snackbarHostState,
         onStart = ::requestStart,
         onStop = viewModel::stop,
+        onOpenScan = ::openScan,
     )
 }
 
